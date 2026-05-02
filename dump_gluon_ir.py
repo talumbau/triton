@@ -9,7 +9,7 @@ import torch
 import triton
 from gluon_gemm_relu import gluon_gemm_relu
 
-OUT_DIR = Path("/tmp/gluon_ir")
+OUT_DIR = Path("/tmp/gluon_ir2")
 OUT_DIR.mkdir(exist_ok=True)
 
 DEVICE = torch.device("cuda")
