@@ -66,7 +66,8 @@ TensileLite epilogue handles:
 """
 
 TENSILE_ASM = "/tmp/build_128x128_userocasm/1_BenchmarkProblems/Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_00/00_Final/source/build_tmp/SOURCE/assembly/Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT1-nh8fOg3oV5iv8N2v2ir2oIhPEhLm5BrUK_Y9lwxoOw=.s"
-GLUON_ASM   = "/tmp/gluon_ir/amdgcn.s"
+#GLUON_ASM   = "/tmp/gluon_ir/amdgcn.s"
+GLUON_ASM = "/tmp/gluon_ir/R5F2HDNZESNDM55F5KZRSWRDH6TASJO3Z3RRIIFIYLWMBKRFP7OA/gluon_gemm_relu_kernel.amdgcn"
 OUTPUT_ASM  = "/tmp/spliced_gemm.s"
 
 with open(TENSILE_ASM) as f:
