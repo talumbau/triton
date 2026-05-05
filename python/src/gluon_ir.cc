@@ -1106,6 +1106,20 @@ void init_gluon_ir(py::module &&m) {
            [](GluonOpBuilder &self) {
              self.create<ttag::ClusterBarrierWaitOp>();
            })
+      .def("create_inline_asm_block",
+           [](GluonOpBuilder &self, const std::string &asmString,
+              const std::string &constraints,
+              const std::vector<Value> &args,
+              const std::vector<Type> &retTypes,
+              bool isPure) -> std::vector<Value> {
+             auto op = self.create<ttag::InlineAsmOp>(
+                 retTypes, asmString, constraints, isPure, args);
+             std::vector<Value> results;
+             for (unsigned i = 0; i < op->getNumResults(); i++) {
+               results.push_back(op->getResult(i));
+             }
+             return results;
+           })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker, int priority) {
              auto border = self.create<ROCDL::SchedBarrier>(0);

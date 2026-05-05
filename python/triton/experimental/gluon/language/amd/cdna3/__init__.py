@@ -12,7 +12,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "buffer_atomic_add", "buffer_atomic_and", "buffer_atomic_min", "buffer_atomic_max", "buffer_atomic_or",
-    "buffer_atomic_xor", "buffer_atomic_xor", "buffer_load", "buffer_store", "mfma", "scaled_upcast"
+    "buffer_atomic_xor", "buffer_atomic_xor", "buffer_load", "buffer_store", "inline_asm_block", "mfma",
+    "scaled_upcast"
 ]
 
 _atomic_op_str_to_op = {
@@ -277,3 +278,44 @@ def buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None, _se
 
     return _buffer_atomic_rmw_impl('xchg', ptr, offsets, value, "cdna3", mask=mask, sem=sem, scope=scope,
                                    _semantic=_semantic)
+
+
+@builtin
+def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, _semantic: GluonSemantic = None):
+    """Execute a block of inline assembly with explicit register constraints.
+
+    Unlike tl.inline_asm_elementwise, this emits exactly ONE asm invocation
+    per thread. Each output corresponds to one constraint (e.g. "=v" for VGPR,
+    "=a" for AccVGPR/AGPR).
+
+    Args:
+        asm: Assembly string (GCN syntax).
+        constraints: LLVM inline asm constraint string.
+        args: List of scalar input values.
+        dtypes: Result dtype (single) or list of result dtypes.
+        is_pure: If True, the asm block has no side effects.
+    Returns:
+        Single value if one output, or tuple of values if multiple outputs.
+    """
+    builder = _semantic.builder
+
+    asm = _unwrap_if_constexpr(asm)
+    constraints = _unwrap_if_constexpr(constraints)
+    is_pure = _unwrap_if_constexpr(is_pure)
+
+    dtypes = _unwrap_if_constexpr(dtypes)
+    if hasattr(dtypes, 'values'):
+        dtypes = dtypes.values
+    if not isinstance(dtypes, (list, tuple)):
+        dtypes = [dtypes]
+    dtypes = [_unwrap_if_constexpr(d) for d in dtypes]
+
+    arg_handles = [a.handle if hasattr(a, 'handle') else a for a in args]
+    ret_types = [dtype.to_ir(builder) for dtype in dtypes]
+
+    results = builder.create_inline_asm_block(asm, constraints, arg_handles, ret_types, is_pure)
+
+    wrapped = [ttgl.tensor(r, dtype) for r, dtype in zip(results, dtypes)]
+    if len(wrapped) == 1:
+        return wrapped[0]
+    return tuple(wrapped)

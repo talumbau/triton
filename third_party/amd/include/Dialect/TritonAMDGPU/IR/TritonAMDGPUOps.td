@@ -1159,4 +1159,38 @@ def ClusterBarrierWaitOp : TT_AMDGPU_Op<"cluster_barrier_wait"> {
   let assemblyFormat = "attr-dict";
 }
 
+//===----------------------------------------------------------------------===//
+// InlineAsmOp
+//===----------------------------------------------------------------------===//
+
+def InlineAsmOp : TT_AMDGPU_Op<"inline_asm", []> {
+  let summary = "Execute an inline assembly block with scalar inputs and outputs";
+
+  let description = [{
+    Executes a single block of inline assembly. Unlike tt.elementwise_inline_asm,
+    this op emits exactly ONE asm invocation per thread — it is not applied
+    elementwise across tensor elements.
+
+    Each output corresponds to one register-class-constrained result (e.g. "=v"
+    for VGPR, "=a" for AccVGPR/AGPR, "=s" for SGPR). The constraint string
+    follows GCN/LLVM inline asm convention.
+
+    Intended for embedding pre-scheduled assembly blocks (e.g. optimized GEMM
+    main loops) inside Gluon kernels.
+  }];
+
+  let arguments = (ins
+    StrAttr:$asm_string,
+    StrAttr:$constraints,
+    BoolAttr:$pure,
+    Variadic<AnyType>:$args
+  );
+
+  let results = (outs Variadic<AnyType>:$result);
+
+  let assemblyFormat = [{
+    $asm_string `,` $constraints `(` $args `)` attr-dict `:` functional-type($args, $result)
+  }];
+}
+
 #endif
