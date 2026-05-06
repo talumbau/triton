@@ -1122,6 +1122,21 @@ void init_gluon_ir(py::module &&m) {
              }
              return results;
            })
+      .def("create_inline_asm_block_tensor",
+           [](GluonOpBuilder &self, const std::string &asmString,
+              const std::string &constraints,
+              const std::vector<Value> &args,
+              Type elemType, std::vector<int64_t> shape,
+              Attribute layout,
+              bool isPure,
+              unsigned sharedMemorySize) -> Value {
+             auto tensorTy = RankedTensorType::get(shape, elemType, layout);
+             std::vector<Type> retTypes = {tensorTy};
+             auto op = self.create<ttag::InlineAsmOp>(
+                 retTypes, asmString, constraints, isPure,
+                 sharedMemorySize, args);
+             return op->getResult(0);
+           })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker, int priority) {
              auto border = self.create<ROCDL::SchedBarrier>(0);

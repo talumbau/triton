@@ -2,6 +2,7 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "third_party/amd/include/TritonAMDGPUToLLVM/PatternTritonAMDGPUToLLVM.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -31,18 +32,41 @@ struct InlineAsmOpConversion
 
     SmallVector<Value> operands(adaptor.getArgs());
 
-    SmallVector<Type> retTypes;
-    for (auto result : op.getResults()) {
-      retTypes.push_back(getTypeConverter()->convertType(result.getType()));
-    }
+    // Check if the single result is a tensor type (distributed tensor return).
+    bool isTensorReturn = op->getNumResults() == 1 &&
+        isa<RankedTensorType>(op->getResult(0).getType());
 
     unsigned numOutputConstraints =
         countOutputConstraints(op.getConstraints());
+
+    SmallVector<Type> retTypes;
+    if (isTensorReturn) {
+      auto tensorTy = cast<RankedTensorType>(op->getResult(0).getType());
+      auto convertedTy = getTypeConverter()->convertType(tensorTy);
+      auto structTy = cast<LLVM::LLVMStructType>(convertedTy);
+      unsigned numElems = structTy.getBody().size();
+      auto elemTy = structTy.getBody()[0];
+      retTypes.resize(numElems, elemTy);
+    } else {
+      for (auto result : op.getResults()) {
+        retTypes.push_back(getTypeConverter()->convertType(result.getType()));
+      }
+    }
+
     bool isBlockReturn =
         numOutputConstraints == 1 && retTypes.size() > 1;
+    bool isMultiBlockReturn =
+        isTensorReturn && numOutputConstraints > 1;
 
     SmallVector<Type> asmRetTypes;
-    if (isBlockReturn) {
+    if (isMultiBlockReturn) {
+      unsigned elemsPerBlock = retTypes.size() / numOutputConstraints;
+      for (unsigned b = 0; b < numOutputConstraints; b++) {
+        auto vecTy = VectorType::get(
+            {static_cast<int64_t>(elemsPerBlock)}, retTypes[0]);
+        asmRetTypes.push_back(vecTy);
+      }
+    } else if (isBlockReturn) {
       auto vecTy = VectorType::get(
           {static_cast<int64_t>(retTypes.size())}, retTypes[0]);
       asmRetTypes.push_back(vecTy);
@@ -72,7 +96,45 @@ struct InlineAsmOpConversion
                                   LLVM::AsmDialect::AD_ATT),
         /*operand_attrs=*/ArrayAttr());
 
-    if (retTypes.empty()) {
+    if (isMultiBlockReturn) {
+      // Multiple block outputs forming a single tensor.
+      // asm returns a struct of vectors; extract each vector, then each element.
+      auto tensorTy = cast<RankedTensorType>(op->getResult(0).getType());
+      SmallVector<Value> scalarVals;
+      unsigned elemsPerBlock = retTypes.size() / numOutputConstraints;
+      auto i32Ty = IntegerType::get(rewriter.getContext(), 32);
+
+      for (unsigned b = 0; b < numOutputConstraints; b++) {
+        Value vec = LLVM::ExtractValueOp::create(
+            rewriter, loc, asmOp->getResult(0), b);
+        for (unsigned i = 0; i < elemsPerBlock; i++) {
+          Value idx = LLVM::ConstantOp::create(
+              rewriter, loc, i32Ty,
+              rewriter.getI32IntegerAttr(i));
+          scalarVals.push_back(LLVM::ExtractElementOp::create(
+              rewriter, loc, vec, idx));
+        }
+      }
+      Value packed = packLLElements(loc, getTypeConverter(), scalarVals,
+                                    rewriter, tensorTy);
+      rewriter.replaceOp(op, packed);
+    } else if (isTensorReturn) {
+      // Single block output forming a tensor.
+      auto tensorTy = cast<RankedTensorType>(op->getResult(0).getType());
+      SmallVector<Value> scalarVals;
+      Value vec = asmOp->getResult(0);
+      auto i32Ty = IntegerType::get(rewriter.getContext(), 32);
+      for (unsigned i = 0; i < retTypes.size(); i++) {
+        Value idx = LLVM::ConstantOp::create(
+            rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(i));
+        scalarVals.push_back(LLVM::ExtractElementOp::create(
+            rewriter, loc, vec, idx));
+      }
+      Value packed = packLLElements(loc, getTypeConverter(), scalarVals,
+                                    rewriter, tensorTy);
+      rewriter.replaceOp(op, packed);
+    } else if (retTypes.empty()) {
       rewriter.eraseOp(op);
     } else if (isBlockReturn) {
       SmallVector<Value> results;

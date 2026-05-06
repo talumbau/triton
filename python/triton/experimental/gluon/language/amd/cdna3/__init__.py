@@ -282,6 +282,7 @@ def buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None, _se
 
 @builtin
 def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, lds_bytes=0,
+                     output_layout=None, output_shape=None,
                      _semantic: GluonSemantic = None):
     """Execute a block of inline assembly with explicit register constraints.
 
@@ -294,10 +295,15 @@ def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, lds_bytes=0,
         constraints: LLVM inline asm constraint string.
         args: List of scalar input values (supports constexpr int/float).
         dtypes: Result dtype (single), list of result dtypes, or empty tuple for void.
+            For tensor return, a single dtype specifying the element type.
         is_pure: If True, the asm block has no side effects.
         lds_bytes: Shared memory (LDS) bytes required by the asm block.
+        output_layout: A DistributedLayout describing the tensor distribution.
+            When set, returns a distributed tensor instead of scalars.
+        output_shape: Shape of the output tensor (required with output_layout).
     Returns:
-        Single value if one output, tuple if multiple, or None if void.
+        Single value if one output, tuple if multiple, None if void,
+        or a distributed tensor if output_layout is set.
     """
     builder = _semantic.builder
 
@@ -305,13 +311,8 @@ def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, lds_bytes=0,
     constraints = _unwrap_if_constexpr(constraints)
     is_pure = _unwrap_if_constexpr(is_pure)
     lds_bytes = _unwrap_if_constexpr(lds_bytes)
-
-    dtypes = _unwrap_if_constexpr(dtypes)
-    if hasattr(dtypes, 'values'):
-        dtypes = dtypes.values
-    if not isinstance(dtypes, (list, tuple)):
-        dtypes = [dtypes]
-    dtypes = [_unwrap_if_constexpr(d) for d in dtypes]
+    output_layout = _unwrap_if_constexpr(output_layout)
+    output_shape = _unwrap_if_constexpr(output_shape)
 
     arg_handles = []
     for a in args:
@@ -324,6 +325,33 @@ def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, lds_bytes=0,
             arg_handles.append(builder.get_fp32(a))
         else:
             arg_handles.append(a)
+
+    if output_layout is not None:
+        assert output_shape is not None, "output_shape required with output_layout"
+        dtypes = _unwrap_if_constexpr(dtypes)
+        if hasattr(dtypes, 'values'):
+            dtypes = dtypes.values
+        if isinstance(dtypes, (list, tuple)):
+            assert len(dtypes) == 1, "tensor return requires exactly one dtype"
+            elem_dtype = _unwrap_if_constexpr(dtypes[0])
+        else:
+            elem_dtype = _unwrap_if_constexpr(dtypes)
+        elem_ir_type = elem_dtype.to_ir(builder)
+        layout_attr = output_layout._to_ir(builder)
+        output_shape = [int(s) for s in output_shape]
+        result_handle = builder.create_inline_asm_block_tensor(
+            asm, constraints, arg_handles,
+            elem_ir_type, output_shape, layout_attr,
+            is_pure, lds_bytes)
+        ret_type = ttgl.distributed_type(elem_dtype, output_shape, output_layout)
+        return ttgl.tensor(result_handle, ret_type)
+
+    dtypes = _unwrap_if_constexpr(dtypes)
+    if hasattr(dtypes, 'values'):
+        dtypes = dtypes.values
+    if not isinstance(dtypes, (list, tuple)):
+        dtypes = [dtypes]
+    dtypes = [_unwrap_if_constexpr(d) for d in dtypes]
 
     ret_types = [dtype.to_ir(builder) for dtype in dtypes]
 
