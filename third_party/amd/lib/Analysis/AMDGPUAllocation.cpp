@@ -41,6 +41,9 @@ static unsigned getBufferAtomicScratchSizeInBytes(Operation *op) {
 
 unsigned AMDAllocationAnalysisScratchSizeFn(Operation *op) {
 
+  if (auto asmOp = dyn_cast<amdgpu::InlineAsmOp>(op))
+    return asmOp.getSharedMemorySize();
+
   if (auto cvtLayout = dyn_cast<mlir::triton::gpu::ConvertLayoutOp>(op)) {
     auto srcTy = cvtLayout.getSrc().getType();
     auto dstTy = cvtLayout.getType();

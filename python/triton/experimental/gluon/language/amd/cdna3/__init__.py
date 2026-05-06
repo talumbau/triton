@@ -281,7 +281,8 @@ def buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None, _se
 
 
 @builtin
-def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, _semantic: GluonSemantic = None):
+def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, lds_bytes=0,
+                     _semantic: GluonSemantic = None):
     """Execute a block of inline assembly with explicit register constraints.
 
     Unlike tl.inline_asm_elementwise, this emits exactly ONE asm invocation
@@ -291,17 +292,19 @@ def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, _semantic: G
     Args:
         asm: Assembly string (GCN syntax).
         constraints: LLVM inline asm constraint string.
-        args: List of scalar input values.
-        dtypes: Result dtype (single) or list of result dtypes.
+        args: List of scalar input values (supports constexpr int/float).
+        dtypes: Result dtype (single), list of result dtypes, or empty tuple for void.
         is_pure: If True, the asm block has no side effects.
+        lds_bytes: Shared memory (LDS) bytes required by the asm block.
     Returns:
-        Single value if one output, or tuple of values if multiple outputs.
+        Single value if one output, tuple if multiple, or None if void.
     """
     builder = _semantic.builder
 
     asm = _unwrap_if_constexpr(asm)
     constraints = _unwrap_if_constexpr(constraints)
     is_pure = _unwrap_if_constexpr(is_pure)
+    lds_bytes = _unwrap_if_constexpr(lds_bytes)
 
     dtypes = _unwrap_if_constexpr(dtypes)
     if hasattr(dtypes, 'values'):
@@ -310,10 +313,22 @@ def inline_asm_block(asm, constraints, args, dtypes, is_pure=False, _semantic: G
         dtypes = [dtypes]
     dtypes = [_unwrap_if_constexpr(d) for d in dtypes]
 
-    arg_handles = [a.handle if hasattr(a, 'handle') else a for a in args]
+    arg_handles = []
+    for a in args:
+        a = _unwrap_if_constexpr(a)
+        if hasattr(a, 'handle'):
+            arg_handles.append(a.handle)
+        elif isinstance(a, int):
+            arg_handles.append(builder.get_int32(a))
+        elif isinstance(a, float):
+            arg_handles.append(builder.get_fp32(a))
+        else:
+            arg_handles.append(a)
+
     ret_types = [dtype.to_ir(builder) for dtype in dtypes]
 
-    results = builder.create_inline_asm_block(asm, constraints, arg_handles, ret_types, is_pure)
+    results = builder.create_inline_asm_block(asm, constraints, arg_handles, ret_types, is_pure,
+                                              lds_bytes)
 
     wrapped = [ttgl.tensor(r, dtype) for r, dtype in zip(results, dtypes)]
     if len(wrapped) == 1:

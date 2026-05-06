@@ -1183,6 +1183,7 @@ def InlineAsmOp : TT_AMDGPU_Op<"inline_asm", []> {
     StrAttr:$asm_string,
     StrAttr:$constraints,
     BoolAttr:$pure,
+    DefaultValuedAttr<I32Attr, "0">:$shared_memory_size,
     Variadic<AnyType>:$args
   );
 

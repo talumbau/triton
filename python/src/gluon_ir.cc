@@ -1111,9 +1111,11 @@ void init_gluon_ir(py::module &&m) {
               const std::string &constraints,
               const std::vector<Value> &args,
               const std::vector<Type> &retTypes,
-              bool isPure) -> std::vector<Value> {
+              bool isPure,
+              unsigned sharedMemorySize) -> std::vector<Value> {
              auto op = self.create<ttag::InlineAsmOp>(
-                 retTypes, asmString, constraints, isPure, args);
+                 retTypes, asmString, constraints, isPure,
+                 sharedMemorySize, args);
              std::vector<Value> results;
              for (unsigned i = 0; i < op->getNumResults(); i++) {
                results.push_back(op->getResult(i));
