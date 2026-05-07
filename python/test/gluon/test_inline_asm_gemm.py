@@ -405,6 +405,30 @@ def _build_accvgpr_bridge_224():
     return "\n".join(lines) + "\n"
 
 
+def _build_accvgpr_bridge_224_tensor():
+    """Read 112 AccVGPRs into v0..v111 reordered for DistributedLinearLayout, zero-pad v112..v127.
+
+    Register r maps to layout position via:
+      v = r & 3           → N += v        (reg bases [0,1], [0,2])
+      wt_n = (r>>2) & 3   → M += wt_n     (reg bases [1,0], [2,0])
+      wt_m = (r>>4) & 7   → N += wt_m*32  (reg bases [0,32], [0,64], [0,128])
+
+    AccVGPR index = wt_m*16 + wt_n*4 + v.
+    Registers 112..127 (wt_m=7) are padding — zeroed so masked stores skip them.
+    """
+    lines = []
+    for r in range(128):
+        wt_m = (r >> 4) & 7
+        wt_n = (r >> 2) & 3
+        v = r & 3
+        if wt_m < 7:
+            acc_idx = wt_m * 16 + wt_n * 4 + v
+            lines.append(f"v_accvgpr_read_b32 v{r}, acc{acc_idx}")
+        else:
+            lines.append(f"v_mov_b32 v{r}, 0")
+    return "\n".join(lines) + "\n"
+
+
 def _build_custom_epilogue_224():
     """Build epilogue for 128x224 tile: bf16 conversion + global stores.
 
@@ -526,16 +550,40 @@ def _build_constraints_224(native_epilogue=False):
     return ",".join(inputs + clobbers)
 
 
-def build_gemm_asm_224(native_epilogue=False):
+def _build_constraints_224_tensor():
+    """Build constraints for 128x224 tensor return with 8 pinned output blocks.
+
+    8 output blocks of 16 VGPRs each (v[0:15] through v[112:127]) +
+    9 SGPR inputs + clobbers (v128..v255, s0..s79, a0..a111).
+    """
+    outputs = [f"={{v[{i*16}:{i*16+15}]}}" for i in range(8)]
+    inputs = ["s"] * 9
+
+    clobbers = ["~{memory}", "~{m0}", "~{vcc}"]
+    for i in range(128, 256):
+        clobbers.append(f"~{{v{i}}}")
+    for i in range(80):
+        clobbers.append(f"~{{s{i}}}")
+    for i in range(112):
+        clobbers.append(f"~{{a{i}}}")
+
+    return ",".join(outputs + inputs + clobbers)
+
+
+def build_gemm_asm_224(native_epilogue=False, tensor_return=False):
     """Build the full inline asm for the 128x224 pure GEMM kernel.
 
     Args:
         native_epilogue: If True, use TensileLite's native buffer_store epilogue
             instead of the custom global_store epilogue. Adds a 10th operand
             (num_wg_n) for edge detection.
+        tensor_return: If True, return f32 accumulators as a distributed tensor.
+            Uses 8 pinned output blocks (128 VGPRs), no epilogue.
 
     Returns (asm_string, constraints_string).
     """
+    assert not (native_epilogue and tensor_return), "native_epilogue and tensor_return are mutually exclusive"
+
     if native_epilogue:
         macros, kloop, epilogue_native = _extract_tensile_sections(
             TENSILE_ASM_PATH_224, include_native_epilogue=True)
@@ -563,6 +611,25 @@ s_mov_b32 s19, 0x20000
             "s_nop 7\n",
             srd_post_kloop,
             epilogue_native,
+            "/* Forward-reference labels */\n",
+            "label_OptNLL_End:\n",
+            "label_GSU_3:\n",
+            "label_PrefetchGlobalLastIterEnd:\n",
+        ]
+    elif tensor_return:
+        macros, kloop = _extract_tensile_sections(TENSILE_ASM_PATH_224)
+        bridge = _build_bridge_224(operand_offset=8)
+        accvgpr_bridge = _build_accvgpr_bridge_224_tensor()
+        constraints = _build_constraints_224_tensor()
+
+        asm_parts = [
+            macros,
+            bridge,
+            kloop,
+            "s_waitcnt vmcnt(0) lgkmcnt(0)\n",
+            "s_barrier\n",
+            "s_nop 7\n",
+            accvgpr_bridge,
             "/* Forward-reference labels */\n",
             "label_OptNLL_End:\n",
             "label_GSU_3:\n",
@@ -937,12 +1004,15 @@ except (FileNotFoundError, AssertionError):
 try:
     GEMM_ASM_224, GEMM_CONSTRAINTS_224 = build_gemm_asm_224()
     GEMM_ASM_224_NATIVE, GEMM_CONSTRAINTS_224_NATIVE = build_gemm_asm_224(native_epilogue=True)
+    GEMM_ASM_224_TENSOR, GEMM_CONSTRAINTS_224_TENSOR = build_gemm_asm_224(tensor_return=True)
     ASM_224_AVAILABLE = True
 except (FileNotFoundError, AssertionError):
     GEMM_ASM_224 = ""
     GEMM_CONSTRAINTS_224 = ""
     GEMM_ASM_224_NATIVE = ""
     GEMM_CONSTRAINTS_224_NATIVE = ""
+    GEMM_ASM_224_TENSOR = ""
+    GEMM_CONSTRAINTS_224_TENSOR = ""
     ASM_224_AVAILABLE = False
 
 
@@ -976,6 +1046,14 @@ MFMA_LAYOUT = gl.DistributedLinearLayout(
     warp_bases=[[64, 0], [0, 64]],
     block_bases=[],
     shape=[128, 128],
+)
+
+MFMA_LAYOUT_224 = gl.DistributedLinearLayout(
+    reg_bases=[[0, 1], [0, 2], [1, 0], [2, 0], [0, 32], [0, 64], [0, 128]],
+    lane_bases=[[4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8]],
+    warp_bases=[[64, 0], [0, 16]],
+    block_bases=[],
+    shape=[128, 256],
 )
 
 
@@ -1116,6 +1194,85 @@ def tensilelite_gemm_224_native_kernel(
         is_pure=False,
         lds_bytes=53248,
     )
+
+
+@gluon.jit
+def tensilelite_gemm_224_tensor_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am,
+    GEMM_ASM_STR: gl.constexpr,
+    GEMM_CONSTRAINTS_STR: gl.constexpr,
+):
+    """128x224 GEMM with tensor return: K-loop returns f32 distributed tensor."""
+    pid_m = gl.program_id(0)
+    pid_n = gl.program_id(1)
+
+    mfma_layout: gl.constexpr = MFMA_LAYOUT_224
+
+    result_f32 = cdna3.inline_asm_block(
+        GEMM_ASM_STR,
+        GEMM_CONSTRAINTS_STR,
+        args=[a_ptr, b_ptr, c_ptr,
+              M, N, K,
+              stride_am,
+              pid_m, pid_n],
+        dtypes=tl.float32,
+        is_pure=False,
+        lds_bytes=53248,
+        output_layout=mfma_layout,
+        output_shape=[128, 256],
+    )
+
+    result_bf16 = result_f32.to(tl.bfloat16)
+
+    offs_m = gl.arange(0, 128, layout=gl.SliceLayout(1, mfma_layout))
+    offs_n = gl.arange(0, 256, layout=gl.SliceLayout(0, mfma_layout))
+    global_m = pid_m * 128 + offs_m
+    global_n = pid_n * 224 + offs_n
+    out_ptrs = c_ptr + global_m[:, None] * N + global_n[None, :]
+    mask = offs_n[None, :] < 224
+    gl.store(out_ptrs, result_bf16, mask=mask)
+
+
+@gluon.jit
+def tensilelite_gemm_224_relu_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am,
+    GEMM_ASM_STR: gl.constexpr,
+    GEMM_CONSTRAINTS_STR: gl.constexpr,
+):
+    """128x224 GEMM + ReLU: K-loop → distributed tensor → ReLU → bf16 → store."""
+    pid_m = gl.program_id(0)
+    pid_n = gl.program_id(1)
+
+    mfma_layout: gl.constexpr = MFMA_LAYOUT_224
+
+    result_f32 = cdna3.inline_asm_block(
+        GEMM_ASM_STR,
+        GEMM_CONSTRAINTS_STR,
+        args=[a_ptr, b_ptr, c_ptr,
+              M, N, K,
+              stride_am,
+              pid_m, pid_n],
+        dtypes=tl.float32,
+        is_pure=False,
+        lds_bytes=53248,
+        output_layout=mfma_layout,
+        output_shape=[128, 256],
+    )
+
+    result_relu = tl.maximum(result_f32, 0.0)
+    result_bf16 = result_relu.to(tl.bfloat16)
+
+    offs_m = gl.arange(0, 128, layout=gl.SliceLayout(1, mfma_layout))
+    offs_n = gl.arange(0, 256, layout=gl.SliceLayout(0, mfma_layout))
+    global_m = pid_m * 128 + offs_m
+    global_n = pid_n * 224 + offs_n
+    out_ptrs = c_ptr + global_m[:, None] * N + global_n[None, :]
+    mask = offs_n[None, :] < 224
+    gl.store(out_ptrs, result_bf16, mask=mask)
 
 
 # ---------------------------------------------------------------------------
@@ -1300,6 +1457,66 @@ class TestInlineAsmGemm:
         max_diff = (c.float() - ref.float()).abs().max().item()
         print(f"\n128x224 native epilogue GEMM max_diff = {max_diff:.4f}")
         assert max_diff < 0.5, f"FAIL: 128x224 native GEMM max_diff={max_diff}"
+
+    @pytest.mark.skipif(not is_hip_cdna3(), reason="CDNA3 only")
+    @pytest.mark.skipif(not ASM_224_AVAILABLE, reason="128x224 TensileLite assembly not found")
+    def test_tensilelite_gemm_224_tensor_return(self):
+        """128x224 GEMM with tensor return: K-loop returns distributed f32 tensor."""
+        M, N, K = 2048, 4032, 4096
+        torch.manual_seed(42)
+        a = (torch.randn(M, K, device=DEVICE, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        b = (torch.randn(N, K, device=DEVICE, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        c = torch.zeros(M, N, device=DEVICE, dtype=torch.bfloat16)
+
+        BLOCK_M_224 = 128
+        BLOCK_N_224 = 224
+        grid = (triton.cdiv(M, BLOCK_M_224), triton.cdiv(N, BLOCK_N_224))
+
+        tensilelite_gemm_224_tensor_kernel[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0),
+            GEMM_ASM_STR=GEMM_ASM_224_TENSOR,
+            GEMM_CONSTRAINTS_STR=GEMM_CONSTRAINTS_224_TENSOR,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+
+        ref = torch.matmul(a.float(), b.float().t()).to(torch.bfloat16)
+
+        max_diff = (c.float() - ref.float()).abs().max().item()
+        print(f"\n128x224 tensor return GEMM max_diff = {max_diff:.4f}")
+        assert max_diff < 0.5, f"FAIL: 128x224 tensor return max_diff={max_diff}"
+
+    @pytest.mark.skipif(not is_hip_cdna3(), reason="CDNA3 only")
+    @pytest.mark.skipif(not ASM_224_AVAILABLE, reason="128x224 TensileLite assembly not found")
+    def test_tensilelite_gemm_224_tensor_relu(self):
+        """128x224 GEMM + ReLU: composability proof — TensileLite K-loop + Gluon ReLU."""
+        M, N, K = 2048, 4032, 4096
+        torch.manual_seed(42)
+        a = (torch.randn(M, K, device=DEVICE, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        b = (torch.randn(N, K, device=DEVICE, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        c = torch.zeros(M, N, device=DEVICE, dtype=torch.bfloat16)
+
+        BLOCK_M_224 = 128
+        BLOCK_N_224 = 224
+        grid = (triton.cdiv(M, BLOCK_M_224), triton.cdiv(N, BLOCK_N_224))
+
+        tensilelite_gemm_224_relu_kernel[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0),
+            GEMM_ASM_STR=GEMM_ASM_224_TENSOR,
+            GEMM_CONSTRAINTS_STR=GEMM_CONSTRAINTS_224_TENSOR,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+
+        ref = torch.clamp(torch.matmul(a.float(), b.float().t()), min=0).to(torch.bfloat16)
+
+        max_diff = (c.float() - ref.float()).abs().max().item()
+        print(f"\n128x224 GEMM+ReLU max_diff = {max_diff:.4f}")
+        assert max_diff < 0.5, f"FAIL: 128x224 GEMM+ReLU max_diff={max_diff}"
 
 
 def _benchmark_kernel(fn, *args, warmup=20, rep=100, **kwargs):
