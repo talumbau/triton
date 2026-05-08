@@ -1275,6 +1275,155 @@ def tensilelite_gemm_224_relu_kernel(
     gl.store(out_ptrs, result_bf16, mask=mask)
 
 
+@gluon.jit
+def tensilelite_gemm_224_tensor_xcc_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am,
+    GEMM_ASM_STR: gl.constexpr,
+    GEMM_CONSTRAINTS_STR: gl.constexpr,
+    NUM_TILES_M: gl.constexpr,
+    NUM_TILES_N: gl.constexpr,
+    WGMXCC: gl.constexpr,
+):
+    """128x224 GEMM with tensor return + WGMXCC tile mapping (1D grid)."""
+    flat_id = gl.program_id(0)
+
+    total: gl.constexpr = NUM_TILES_M * NUM_TILES_N
+    tiles_per_xcc: gl.constexpr = total // WGMXCC
+    total_rounded: gl.constexpr = tiles_per_xcc * WGMXCC
+
+    xcc_id = flat_id % WGMXCC
+    local_id = flat_id // WGMXCC
+    remapped = tl.where(flat_id < total_rounded,
+                        xcc_id * tiles_per_xcc + local_id,
+                        flat_id)
+
+    pid_m = remapped % NUM_TILES_M
+    pid_n = remapped // NUM_TILES_M
+
+    mfma_layout: gl.constexpr = MFMA_LAYOUT_224
+
+    result_f32 = cdna3.inline_asm_block(
+        GEMM_ASM_STR,
+        GEMM_CONSTRAINTS_STR,
+        args=[a_ptr, b_ptr, c_ptr,
+              M, N, K,
+              stride_am,
+              pid_m, pid_n],
+        dtypes=tl.float32,
+        is_pure=False,
+        lds_bytes=53248,
+        output_layout=mfma_layout,
+        output_shape=[128, 256],
+    )
+
+    result_bf16 = result_f32.to(tl.bfloat16)
+
+    offs_m = gl.arange(0, 128, layout=gl.SliceLayout(1, mfma_layout))
+    offs_n = gl.arange(0, 256, layout=gl.SliceLayout(0, mfma_layout))
+    global_m = pid_m * 128 + offs_m
+    global_n = pid_n * 224 + offs_n
+    out_ptrs = c_ptr + global_m[:, None] * N + global_n[None, :]
+    mask = offs_n[None, :] < 224
+    gl.store(out_ptrs, result_bf16, mask=mask)
+
+
+@gluon.jit
+def tensilelite_gemm_224_relu_xcc_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am,
+    GEMM_ASM_STR: gl.constexpr,
+    GEMM_CONSTRAINTS_STR: gl.constexpr,
+    NUM_TILES_M: gl.constexpr,
+    NUM_TILES_N: gl.constexpr,
+    WGMXCC: gl.constexpr,
+):
+    """128x224 GEMM + ReLU with WGMXCC tile mapping (1D grid)."""
+    flat_id = gl.program_id(0)
+
+    total: gl.constexpr = NUM_TILES_M * NUM_TILES_N
+    tiles_per_xcc: gl.constexpr = total // WGMXCC
+    total_rounded: gl.constexpr = tiles_per_xcc * WGMXCC
+
+    xcc_id = flat_id % WGMXCC
+    local_id = flat_id // WGMXCC
+    remapped = tl.where(flat_id < total_rounded,
+                        xcc_id * tiles_per_xcc + local_id,
+                        flat_id)
+
+    pid_m = remapped % NUM_TILES_M
+    pid_n = remapped // NUM_TILES_M
+
+    mfma_layout: gl.constexpr = MFMA_LAYOUT_224
+
+    result_f32 = cdna3.inline_asm_block(
+        GEMM_ASM_STR,
+        GEMM_CONSTRAINTS_STR,
+        args=[a_ptr, b_ptr, c_ptr,
+              M, N, K,
+              stride_am,
+              pid_m, pid_n],
+        dtypes=tl.float32,
+        is_pure=False,
+        lds_bytes=53248,
+        output_layout=mfma_layout,
+        output_shape=[128, 256],
+    )
+
+    result_relu = tl.maximum(result_f32, 0.0)
+    result_bf16 = result_relu.to(tl.bfloat16)
+
+    offs_m = gl.arange(0, 128, layout=gl.SliceLayout(1, mfma_layout))
+    offs_n = gl.arange(0, 256, layout=gl.SliceLayout(0, mfma_layout))
+    global_m = pid_m * 128 + offs_m
+    global_n = pid_n * 224 + offs_n
+    out_ptrs = c_ptr + global_m[:, None] * N + global_n[None, :]
+    mask = offs_n[None, :] < 224
+    gl.store(out_ptrs, result_bf16, mask=mask)
+
+
+@gluon.jit
+def tensilelite_gemm_224_xcc_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am,
+    GEMM_ASM_STR: gl.constexpr,
+    GEMM_CONSTRAINTS_STR: gl.constexpr,
+    NUM_TILES_M: gl.constexpr,
+    NUM_TILES_N: gl.constexpr,
+    WGMXCC: gl.constexpr,
+):
+    """128x224 GEMM with void return + WGMXCC tile mapping (1D grid)."""
+    flat_id = gl.program_id(0)
+
+    total: gl.constexpr = NUM_TILES_M * NUM_TILES_N
+    tiles_per_xcc: gl.constexpr = total // WGMXCC
+    total_rounded: gl.constexpr = tiles_per_xcc * WGMXCC
+
+    xcc_id = flat_id % WGMXCC
+    local_id = flat_id // WGMXCC
+    remapped = tl.where(flat_id < total_rounded,
+                        xcc_id * tiles_per_xcc + local_id,
+                        flat_id)
+
+    pid_m = remapped % NUM_TILES_M
+    pid_n = remapped // NUM_TILES_M
+
+    cdna3.inline_asm_block(
+        GEMM_ASM_STR,
+        GEMM_CONSTRAINTS_STR,
+        args=[a_ptr, b_ptr, c_ptr,
+              M, N, K,
+              stride_am,
+              pid_m, pid_n],
+        dtypes=(),
+        is_pure=False,
+        lds_bytes=53248,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
@@ -1517,6 +1666,76 @@ class TestInlineAsmGemm:
         max_diff = (c.float() - ref.float()).abs().max().item()
         print(f"\n128x224 GEMM+ReLU max_diff = {max_diff:.4f}")
         assert max_diff < 0.5, f"FAIL: 128x224 GEMM+ReLU max_diff={max_diff}"
+
+    @pytest.mark.skipif(not is_hip_cdna3(), reason="CDNA3 only")
+    @pytest.mark.skipif(not ASM_224_AVAILABLE, reason="128x224 TensileLite assembly not found")
+    def test_tensilelite_gemm_224_tensor_xcc(self):
+        """128x224 GEMM with tensor return + WGMXCC=8 tile mapping (1D grid)."""
+        M, N, K = 2048, 4032, 4096
+        torch.manual_seed(42)
+        a = (torch.randn(M, K, device=DEVICE, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        b = (torch.randn(N, K, device=DEVICE, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        c = torch.zeros(M, N, device=DEVICE, dtype=torch.bfloat16)
+
+        BLOCK_M_224 = 128
+        BLOCK_N_224 = 224
+        num_tiles_m = triton.cdiv(M, BLOCK_M_224)
+        num_tiles_n = triton.cdiv(N, BLOCK_N_224)
+        grid = (num_tiles_m * num_tiles_n,)
+
+        tensilelite_gemm_224_tensor_xcc_kernel[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0),
+            GEMM_ASM_STR=GEMM_ASM_224_TENSOR,
+            GEMM_CONSTRAINTS_STR=GEMM_CONSTRAINTS_224_TENSOR,
+            NUM_TILES_M=num_tiles_m,
+            NUM_TILES_N=num_tiles_n,
+            WGMXCC=8,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+
+        ref = torch.matmul(a.float(), b.float().t()).to(torch.bfloat16)
+
+        max_diff = (c.float() - ref.float()).abs().max().item()
+        print(f"\n128x224 tensor+XCC GEMM max_diff = {max_diff:.4f}")
+        assert max_diff < 0.5, f"FAIL: 128x224 tensor+XCC max_diff={max_diff}"
+
+    @pytest.mark.skipif(not is_hip_cdna3(), reason="CDNA3 only")
+    @pytest.mark.skipif(not ASM_224_AVAILABLE, reason="128x224 TensileLite assembly not found")
+    def test_tensilelite_gemm_224_relu_xcc(self):
+        """128x224 GEMM + ReLU with WGMXCC=8 tile mapping (1D grid)."""
+        M, N, K = 2048, 4032, 4096
+        torch.manual_seed(42)
+        a = (torch.randn(M, K, device=DEVICE, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        b = (torch.randn(N, K, device=DEVICE, dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        c = torch.zeros(M, N, device=DEVICE, dtype=torch.bfloat16)
+
+        BLOCK_M_224 = 128
+        BLOCK_N_224 = 224
+        num_tiles_m = triton.cdiv(M, BLOCK_M_224)
+        num_tiles_n = triton.cdiv(N, BLOCK_N_224)
+        grid = (num_tiles_m * num_tiles_n,)
+
+        tensilelite_gemm_224_relu_xcc_kernel[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0),
+            GEMM_ASM_STR=GEMM_ASM_224_TENSOR,
+            GEMM_CONSTRAINTS_STR=GEMM_CONSTRAINTS_224_TENSOR,
+            NUM_TILES_M=num_tiles_m,
+            NUM_TILES_N=num_tiles_n,
+            WGMXCC=8,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+
+        ref = torch.clamp(torch.matmul(a.float(), b.float().t()), min=0).to(torch.bfloat16)
+
+        max_diff = (c.float() - ref.float()).abs().max().item()
+        print(f"\n128x224 GEMM+ReLU+XCC max_diff = {max_diff:.4f}")
+        assert max_diff < 0.5, f"FAIL: 128x224 GEMM+ReLU+XCC max_diff={max_diff}"
 
 
 def _benchmark_kernel(fn, *args, warmup=20, rep=100, **kwargs):

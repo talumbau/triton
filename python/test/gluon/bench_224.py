@@ -13,6 +13,8 @@ from test_inline_asm_gemm import (
     tensilelite_gemm_224_native_kernel,
     tensilelite_gemm_224_tensor_kernel,
     tensilelite_gemm_224_relu_kernel,
+    tensilelite_gemm_224_tensor_xcc_kernel,
+    tensilelite_gemm_224_relu_xcc_kernel,
 )
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -137,6 +139,39 @@ def main():
     ms = triton.testing.do_bench(fn_relu, warmup=25, rep=100)
     diff = (c_relu.float() - ref_relu.float()).abs().max().item()
     results.append(("TensileLite 128x224 +ReLU", ms, tflops(M, N, K, ms), diff))
+
+    # --- 128x224 tensor return + WGMXCC=8 (XCC locality) ---
+    c_xcc = torch.zeros(M, N, device=DEVICE, dtype=torch.bfloat16)
+    num_tiles_m = triton.cdiv(M, BLOCK_M_224)
+    num_tiles_n = triton.cdiv(N, BLOCK_N_224)
+    grid_1d = (num_tiles_m * num_tiles_n,)
+
+    def fn_xcc():
+        tensilelite_gemm_224_tensor_xcc_kernel[grid_1d](
+            a, b, c_xcc, M, N, K, a.stride(0),
+            GEMM_ASM_STR=gemm_asm_t, GEMM_CONSTRAINTS_STR=gemm_constraints_t,
+            NUM_TILES_M=num_tiles_m, NUM_TILES_N=num_tiles_n, WGMXCC=8,
+            num_warps=4,
+        )
+    fn_xcc(); torch.cuda.synchronize()
+    ms = triton.testing.do_bench(fn_xcc, warmup=25, rep=100)
+    diff = (c_xcc.float() - ref.float()).abs().max().item()
+    results.append(("TensileLite 128x224 +XCC", ms, tflops(M, N, K, ms), diff))
+
+    # --- 128x224 tensor return + WGMXCC=8 + ReLU ---
+    c_relu_xcc = torch.zeros(M, N, device=DEVICE, dtype=torch.bfloat16)
+
+    def fn_relu_xcc():
+        tensilelite_gemm_224_relu_xcc_kernel[grid_1d](
+            a, b, c_relu_xcc, M, N, K, a.stride(0),
+            GEMM_ASM_STR=gemm_asm_t, GEMM_CONSTRAINTS_STR=gemm_constraints_t,
+            NUM_TILES_M=num_tiles_m, NUM_TILES_N=num_tiles_n, WGMXCC=8,
+            num_warps=4,
+        )
+    fn_relu_xcc(); torch.cuda.synchronize()
+    ms = triton.testing.do_bench(fn_relu_xcc, warmup=25, rep=100)
+    diff = (c_relu_xcc.float() - ref_relu.float()).abs().max().item()
+    results.append(("TensileLite 128x224 +XCC+ReLU", ms, tflops(M, N, K, ms), diff))
 
     # --- Triton tl.dot (A @ B^T via A @ B_transposed) ---
     b_t = b.t().contiguous()
